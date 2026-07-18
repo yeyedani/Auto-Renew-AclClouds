@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-ACLClouds 自动登录与续期脚本 (智能升级版)
-已同步 GitHub Secrets: COOKIE_VALUE, EMAIL, NODE_LINK, PASSWORD, TG_BOT_TOKEN, TG_CHAT_ID
+ACLClouds 自动化守护脚本 (完整版)
+功能：支持 Cookie/密码登录，自动续期，Telegram 通知
+配置：已同步所有 GitHub Secrets 环境变量
 """
 
 import os
@@ -12,10 +13,10 @@ from seleniumbase import SB
 
 # ==================== 全局配置 ====================
 BASE_URL = "https://aclclouds.com"
-LOGIN_URL = f"{BASE_URL}/login"
+LOGIN_URL = "https://aclclouds.com/auth/login"
 PROJECTS_URL = "https://aclclouds.com/dashboard/projects"
 
-# 从环境变量获取参数 (与您的 Secrets 名称严格一致)
+# 获取环境变量 (确保与 GitHub Secrets 名称一致)
 COOKIE_VALUE = os.getenv('COOKIE_VALUE', '').strip()
 EMAIL = os.getenv('EMAIL', '').strip()
 PASSWORD = os.getenv('PASSWORD', '').strip()
@@ -47,6 +48,7 @@ def send_telegram_notify(message):
 
 def is_logged_in(sb):
     """判断当前是否处于已登录状态"""
+    # 通过查找特定的登出链接或用户中心特征判断登录状态
     try:
         if sb.is_element_visible('a[href*="/logout"]') or sb.is_text_visible("退出") or sb.is_element_visible('.nav-item'):
             return True
@@ -67,6 +69,7 @@ def try_remember_cookie_login(sb):
     sb.sleep(2)
 
     cookies_to_add = []
+    # 尝试解析 JSON 格式
     if COOKIE_VALUE.startswith('[') and COOKIE_VALUE.endswith(']'):
         try:
             raw_list = json.loads(COOKIE_VALUE)
@@ -82,7 +85,7 @@ def try_remember_cookie_login(sb):
         try: sb.add_cookie(c)
         except: pass
 
-    # 强制跳转项目页验证
+    # 登录后跳转至项目页进行验证
     sb.open(PROJECTS_URL)
     sb.wait_for_ready_state_complete()
     sb.sleep(3)
@@ -101,13 +104,17 @@ def try_password_login(sb):
 
     print("🔑 正在尝试使用账号和密码登录...")
     sb.open(LOGIN_URL)
+    sb.wait_for_ready_state_complete()
     sb.sleep(2)
 
     try:
-        sb.type('input[name="email"], input[type="email"], input[name="username"]', EMAIL)
-        sb.type('input[name="password"]', PASSWORD)
-        sb.click('button[type="submit"]')
+        # 宽泛选择器以兼容可能的页面布局变动
+        sb.type('input[name="email"], input[name="username"], input[type="email"], input[type="text"]', EMAIL)
+        sb.type('input[name="password"], input[type="password"]', PASSWORD)
+        sb.click('button[type="submit"], input[type="submit"]')
         sb.sleep(5)
+        
+        # 登录后跳转至项目页
         sb.open(PROJECTS_URL)
         sb.wait_for_ready_state_complete()
         
@@ -128,36 +135,42 @@ def perform_renewal_task(sb):
     sb.sleep(3)
 
     try:
-        # 如果需要用到 NODE_LINK，可以在这里通过 sb.open(NODE_LINK) 访问特定节点
+        # 如果需要跳转到 NODE_LINK，可在此处添加访问逻辑
         if NODE_LINK:
             print(f"🔗 检测到节点链接，准备访问: {NODE_LINK}")
-            # sb.open(NODE_LINK) # 如有特定操作需求可取消注释
         
-        renew_buttons = sb.find_elements('button:contains("Renew"), button:contains("延长"), button:contains("续期")')
+        # 查找页面上的“续期”相关按钮
+        renew_buttons = sb.find_elements('button:contains("Renew"), button:contains("延长"), button:contains("续期"), a:contains("Renew")')
         
         if not renew_buttons:
             print("ℹ️ 当前未发现可点击的续期按钮。")
-            return "登录成功，但未发现续期按钮。"
+            return "登录成功，但未发现可点击的续期/延长按钮（可能未到期）。"
 
         for btn in renew_buttons:
             btn.click()
             sb.sleep(2)
 
-        return "流程执行完毕。"
+        return "续期操作流程已执行。"
     except Exception as e:
-        return f"执行出错: {str(e)}"
+        return f"执行业务逻辑时出错: {str(e)}"
 
 
 def main():
     print("🚀 启动 ACLClouds 自动化守护脚本")
+    # 默认 headless=True，如需本地调试可见窗口，可改为 False
     with SB(uc=True, headless=True) as sb:
         try:
             login_success = False
+            
+            # 1. 优先尝试 Cookie
             if COOKIE_VALUE:
                 login_success = try_remember_cookie_login(sb)
+            
+            # 2. 备用密码登录
             if not login_success and EMAIL and PASSWORD:
                 login_success = try_password_login(sb)
 
+            # 3. 执行业务
             if login_success:
                 result_msg = perform_renewal_task(sb)
                 send_telegram_notify(f"✅ 执行结果: {result_msg}")
