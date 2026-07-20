@@ -5,25 +5,27 @@ import os
 import re
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
-from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException
+from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException, StaleElementReferenceException
 from selenium.webdriver.common.by import By
 from zoneinfo import ZoneInfo
 
 # ----- 配置（从环境变量读取或在双引号内填写） -----
 EMAIL = os.getenv('EMAIL') or ""
 PASSWORD = os.getenv('PASSWORD') or ""
-COOKIE_VALUE = os.getenv('COOKIE_VALUE') or ""
 TG_CHAT_ID = os.getenv('TG_CHAT_ID') or ""
 TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN') or ""
 
 LOGIN_PATH = '/auth/login'
 BASE_URL = 'https://dash.aclclouds.com'
-PROJECTS_URL = f'{BASE_URL}/projects'
+PROJECTS_URL = f'{BASE_URL}/dashboard/projects'
 
 def beijing_time_str():
-    return datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        return datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
 
 def send_telegram(message):
     if TG_BOT_TOKEN and TG_CHAT_ID:
@@ -46,25 +48,6 @@ def wait_for_url_change(sb, original_url, timeout=30):
         sb.sleep(0.5)
     raise Exception(f"等待 URL 变化超时 ({timeout}秒)，当前仍为: {original_url}")
 
-def extract_remember_cookie_value(raw_cookie):
-    """支持纯 value、name=value、或从浏览器复制的完整 Cookie 字符串。"""
-    if not raw_cookie:
-        return ''
-
-    raw_cookie = raw_cookie.strip().strip('"').strip("'")
-    if not raw_cookie:
-        return ''
-
-    parts = [part.strip() for part in raw_cookie.split(';') if part.strip()]
-    for part in parts:
-        if part.startswith(f'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d='):
-            return part.split('=', 1)[1].strip()
-
-    if len(parts) == 1 and '=' in parts[0]:
-        return parts[0].split('=', 1)[1].strip()
-
-    return raw_cookie
-
 def is_login_page(sb):
     return LOGIN_PATH in sb.get_current_url()
 
@@ -77,21 +60,25 @@ def scroll_to_selector(sb, selector):
     sb.sleep(0.2)
 
 def safe_click_element(sb, element, label):
-    sb.driver.execute_script(
-        'arguments[0].scrollIntoView({block: "center", inline: "center"});',
-        element,
-    )
-    sb.sleep(0.5)
-
     try:
-        element.click()
-        return True
-    except (ElementClickInterceptedException, WebDriverException) as e:
-        print(f"{label} 普通点击失败，改用 JavaScript 点击: {e}")
+        sb.driver.execute_script(
+            'arguments[0].scrollIntoView({block: "center", inline: "center"});',
+            element,
+        )
+        sb.sleep(0.5)
 
-    sb.driver.execute_script('arguments[0].click();', element)
-    sb.sleep(0.5)
-    return True
+        try:
+            element.click()
+            return True
+        except (ElementClickInterceptedException, WebDriverException, StaleElementReferenceException) as e:
+            print(f"{label} 普通点击失败，改用 JavaScript 点击: {e}")
+
+        sb.driver.execute_script('arguments[0].click();', element)
+        sb.sleep(0.5)
+        return True
+    except StaleElementReferenceException:
+        print(f"{label} 元素已失效，点击前需要重新定位")
+        return False
 
 def element_text(element):
     try:
@@ -437,7 +424,7 @@ def has_renew_antibot_modal(sb):
     return False
 
 def click_captcha_checkbox(sb, label='验证码', timeout=10):
-    """点击 ACLClouds 页面上的人机验证复选框。"""
+    """点击 ACLClouds 页面上的人机验证复选框，并处理图形验证码挑战。"""
     selectors = [
         'div.auth-captcha-inner[role="checkbox"]',
         '//div[contains(., "Anti-bot confirmation")]//*[@role="checkbox"]',
@@ -446,36 +433,225 @@ def click_captcha_checkbox(sb, label='验证码', timeout=10):
     ]
 
     last_error = None
-    for selector in selectors:
+    clicked = False
+    selector = None
+    for candidate in selectors:
         try:
-            sb.wait_for_element_visible(selector, timeout=timeout)
-            scroll_to_selector(sb, selector)
-            sb.uc_click(selector)
+            sb.wait_for_element_visible(candidate, timeout=timeout)
+            scroll_to_selector(sb, candidate)
+            sb.uc_click(candidate)
             sb.sleep(1)
-
-            checked = sb.get_attribute(selector, 'aria-checked')
-            if checked is None and label.startswith('续期') and not has_renew_antibot_modal(sb):
-                print(f"{label}点击后窗口已关闭，继续检查续期结果")
-                return True
-            print(f"{label}点击完成，勾选状态: {checked}")
-            if checked != 'true':
-                print(f"{label}未确认勾选，尝试再次点击")
-                try:
-                    sb.click(selector)
-                except Exception as e:
-                    print(f"{label}二次点击被拦截，尝试 JavaScript 点击: {e}")
-                    if selector.startswith('//'):
-                        checkbox = sb.driver.find_element(By.XPATH, selector)
-                    else:
-                        checkbox = sb.driver.find_element(By.CSS_SELECTOR, selector)
-                    safe_click_element(sb, checkbox, label)
-                sb.sleep(1)
-            return True
+            selector = candidate
+            clicked = True
+            break
         except Exception as e:
             last_error = e
+            continue
 
-    if not label.startswith('续期'):
-        print(f"{label}操作异常: {last_error}")
+    if not clicked:
+        print(f"{label} 点击复选框失败: {last_error}")
+        return False
+
+    # 这里给 5 秒的加载缓冲，避免图形验证码尚未渲染完成时就开始点击
+    sb.sleep(5)
+    captcha_ok = handle_captcha_challenge(sb, label, timeout=20)
+    if not captcha_ok:
+        print(f"{label} 验证流程未完成，等待状态仍未确认。")
+        return False
+
+    # 验证复选框是否已勾选
+    try:
+        checked = sb.get_attribute(selector, 'aria-checked')
+        if checked == 'true':
+            print(f"{label} 验证通过")
+            return True
+        else:
+            print(f"{label} 验证未完成，当前状态: {checked}")
+            return False
+    except Exception:
+        return False
+
+def handle_captcha_challenge(sb, label='验证码', timeout=20):
+    """处理图形验证码挑战：先等待挑战加载，再尝试点击对应图像。"""
+    start_time = time.time()
+    challenge = None
+    last_error = None
+    challenge_selectors = [
+        '.auth-captcha-challenge',
+        '.auth-capcha-challenge',
+        '//*[contains(@class, "captcha") and contains(@class, "challenge")]',
+        '//*[contains(@aria-label, "Click on ") or contains(@aria-label, "Select ") or contains(@class, "challenge")]',
+    ]
+
+    def get_challenge():
+        for selector in challenge_selectors:
+            try:
+                if selector.startswith('/'):
+                    elems = sb.driver.find_elements(By.XPATH, selector)
+                    for elem in elems:
+                        if elem.is_displayed():
+                            return elem
+                else:
+                    elem = sb.wait_for_element_visible(selector, timeout=1)
+                    if elem and elem.is_displayed():
+                        return elem
+            except Exception:
+                continue
+        return None
+
+    while time.time() - start_time < timeout:
+        challenge = get_challenge()
+        if challenge:
+            print(f"{label} 检测到图形验证码挑战")
+            break
+        try:
+            checkbox = sb.driver.find_element(By.CSS_SELECTOR, 'div.auth-captcha-inner[role="checkbox"]')
+            if checkbox.get_attribute('aria-checked') == 'true':
+                print(f"{label} 验证复选框已勾选，验证码流程已完成")
+                return True
+        except Exception:
+            pass
+        sb.sleep(0.3)
+
+    if not challenge:
+        print(f"{label} 等待验证码挑战加载超时: {last_error}")
+        return False
+
+    target = ''
+    try:
+        prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-captcha-prompt strong')
+        target = prompt.text.strip()
+    except Exception:
+        pass
+    if not target:
+        try:
+            prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-capcha-prompt strong')
+            target = prompt.text.strip()
+        except Exception:
+            pass
+    if not target:
+        aria_label = challenge.get_attribute('aria-label') or ''
+        if 'Click on ' in aria_label:
+            target = aria_label.split('Click on ')[-1].strip()
+
+    print(f"{label} 目标文本: {target or '未识别'}")
+
+    option_selectors = [
+        '.auth-captcha-option',
+        '.auth-capcha-option',
+        './/button',
+        './/a',
+        './/div[@role="button"]',
+    ]
+
+    def get_options(challenge_elem):
+        for sel in option_selectors:
+            try:
+                if sel.startswith('.') or sel.startswith('['):
+                    elems = challenge_elem.find_elements(By.CSS_SELECTOR, sel)
+                else:
+                    elems = challenge_elem.find_elements(By.XPATH, sel)
+                if elems:
+                    return [elem for elem in elems if elem.is_displayed() and elem.is_enabled()]
+            except Exception:
+                continue
+        return []
+
+    options = get_options(challenge)
+    if not options:
+        print(f"{label} 未找到可点击的选项")
+        return False
+
+    matched = None
+    if target:
+        for opt in options:
+            opt_text = (opt.text or '').strip()
+            if not opt_text:
+                try:
+                    img = opt.find_element(By.TAG_NAME, 'img')
+                    opt_text = (img.get_attribute('alt') or '').strip()
+                except Exception:
+                    pass
+            if not opt_text:
+                try:
+                    opt_text = (opt.get_attribute('aria-label') or '').strip()
+                except Exception:
+                    pass
+            if target.lower() in opt_text.lower():
+                matched = opt
+                break
+
+    attempts = 0
+    max_attempts = 8
+    while attempts < max_attempts:
+        challenge = get_challenge()
+        if not challenge:
+            return False
+
+        options = get_options(challenge)
+        if not options:
+            print(f"{label} 当前挑战没有可点击选项，重试中...")
+            attempts += 1
+            sb.sleep(0.8)
+            continue
+
+        current_target = ''
+        try:
+            prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-captcha-prompt strong')
+            current_target = prompt.text.strip()
+        except Exception:
+            pass
+        if not current_target:
+            aria_label = challenge.get_attribute('aria-label') or ''
+            if 'Click on ' in aria_label:
+                current_target = aria_label.split('Click on ')[-1].strip()
+
+        candidate = None
+        if target and current_target and current_target.lower() == target.lower():
+            for opt in options:
+                opt_text = (opt.text or '').strip()
+                if not opt_text:
+                    try:
+                        img = opt.find_element(By.TAG_NAME, 'img')
+                        opt_text = (img.get_attribute('alt') or '').strip()
+                    except Exception:
+                        pass
+                if not opt_text:
+                    try:
+                        opt_text = (opt.get_attribute('aria-label') or '').strip()
+                    except Exception:
+                        pass
+                if target.lower() in opt_text.lower():
+                    candidate = opt
+                    break
+
+        if candidate is None:
+            candidate = options[0]
+
+        print(f"{label} 点击候选选项 #{attempts + 1} ...")
+        clicked = safe_click_element(sb, candidate, f"{label} 选项候选")
+        if not clicked:
+            attempts += 1
+            sb.sleep(0.8)
+            continue
+
+        sb.sleep(1.2)
+
+        try:
+            checkbox = sb.driver.find_element(By.CSS_SELECTOR, 'div.auth-captcha-inner[role="checkbox"]')
+            if checkbox.get_attribute('aria-checked') == 'true':
+                print(f"{label} 验证复选框已勾选，验证码流程已完成")
+                return True
+        except Exception:
+            pass
+
+        if not get_challenge():
+            print(f"{label} 挑战已消失，验证完成")
+            return True
+
+        attempts += 1
+
+    print(f"{label} 多次尝试后仍未完成验证码")
     return False
 
 def mask_email(email):
@@ -503,12 +679,25 @@ def build_success_message(project_name, old_expiry, new_expiry):
     ]
     return "\n".join(lines)
 
+def build_not_yet_due_message(project_name, expiry):
+    masked_email = mask_email(EMAIL)
+    lines = [
+        "🇫🇷 Aclclouds 续期通知",
+        "",
+        "⏳ 未到续期时间",
+        f"⏱️ 当前过期时间: {expiry}",
+        f"👤 登录账户: {masked_email}",
+        f"⏱️ 运行时间: {beijing_time_str()}",
+    ]
+    return "\n".join(lines)
+
 def build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note):
+    masked_email = mask_email(EMAIL)
     lines = [
         "🇫🇷 Aclclouds 续期通知",
         "",
         f"❌ 续期状态未确认: {project_name}",
-        f"账户: {EMAIL}",
+        f"👤 登录账户: {masked_email}",
     ]
     if old_expiry and old_expiry.lower() not in ['suspended', 'paused', '暂停']:
         lines.append(f"旧过期: {old_expiry}")
@@ -577,42 +766,6 @@ def fill_input(sb, selector, value, label, timeout=15):
 
     return entered_value == value
 
-def try_remember_cookie_login(sb):
-    cookie_value = extract_remember_cookie_value(COOKIE_VALUE)
-    if not cookie_value:
-        print("未配置 Remember Cookie，跳过 Cookie 登录。")
-        return False
-
-    print(f"📋 尝试 Cookie 登录，Cookie value 长度: {len(cookie_value)}")
-    sb.open(BASE_URL)
-    sb.wait_for_ready_state_complete()
-
-    cookie = {
-        'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-        'value': cookie_value,
-        'domain': '.aclclouds.com',
-        'path': '/',
-        'secure': True,
-        'httpOnly': True,
-    }
-    try:
-        sb.add_cookie(cookie)
-    except Exception as e:
-        print(f"带 domain 写入 Cookie 失败，尝试当前域写入: {e}")
-        cookie.pop('domain', None)
-        sb.add_cookie(cookie)
-
-    sb.open(BASE_URL)
-    sb.wait_for_ready_state_complete()
-    time.sleep(3)
-
-    if is_logged_in(sb):
-        print(f"✅ 已通过 Cookie 登录。当前 URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-        return True
-
-    print(f"📋 Cookie 登录未成功，当前 URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-    return False
-
 def login(sb, email, password):
     """执行登录，返回是否成功"""
     print("开始登录流程...")
@@ -626,7 +779,10 @@ def login(sb, email, password):
         print("⚠️ 密码仍未能正确填入。")
 
     # ---- 验证码 ----
-    click_captcha_checkbox(sb, '登录验证码')
+    captcha_ok = click_captcha_checkbox(sb, '登录验证码')
+    if not captcha_ok:
+        print("⚠️ 登录验证码未完成，暂不点击登录按钮，避免直接提交。")
+        return False
 
     sb.sleep(1)
 
@@ -711,29 +867,24 @@ def main():
 
         sb.set_window_size(1366, 768)
 
-        # 1. 尝试 Cookie
-        cookie_login_ok = try_remember_cookie_login(sb)
+        if not is_login_page(sb):
+            sb.open(BASE_URL)
+            sb.wait_for_ready_state_complete()
+            time.sleep(2)
 
-        if not cookie_login_ok:
-            if not is_login_page(sb):
-                sb.open(BASE_URL)
-                sb.wait_for_ready_state_complete()
-                time.sleep(2)
-
-            if is_login_page(sb):
-                print("Cookie 登录失败，执行正常登录...")
-                if not EMAIL or not PASSWORD:
-                    print("❌ 未配置 ACL_EMAIL 或 ACL_PASSWORD，无法执行账号密码登录。")
-                    send_telegram("⚠️ Cookie 登录失败，且未配置 ACL_EMAIL 或 ACL_PASSWORD。")
-                    return
-                if not login(sb, EMAIL, PASSWORD):
-                    return
-            elif is_logged_in(sb):
-                print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-            else:
-                print(f"❌ 未能确认登录状态。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-                send_telegram("⚠️ 未能确认登录状态，请检查 Cookie 或账号密码配置。")
+        if is_login_page(sb):
+            if not EMAIL or not PASSWORD:
+                print("❌ 未配置 ACL_EMAIL 或 ACL_PASSWORD，无法执行账号密码登录。")
+                send_telegram("⚠️ 未配置 ACL_EMAIL 或 ACL_PASSWORD。")
                 return
+            if not login(sb, EMAIL, PASSWORD):
+                return
+        elif is_logged_in(sb):
+            print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
+        else:
+            print(f"❌ 未能确认登录状态。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
+            send_telegram("⚠️ 未能确认登录状态，请检查账号密码配置。")
+            return
 
         # 2. 进入项目页
         sb.open(PROJECTS_URL)
@@ -772,7 +923,7 @@ def main():
                 else:
                     note = get_renew_note(card)
                     print(f"无 Renew 按钮，提示: {note}")
-                    send_telegram(f"🇫🇷 Aclclouds 续期通知\n\n⏳ 未到续期时间\n账户: {EMAIL}\n名称: {project_name}\n过期: {old_expiry}\n提示: {note}\n运行时间: {beijing_time_str()}")
+                    send_telegram(build_not_yet_due_message(project_name, old_expiry))
             except Exception as e:
                 print(f"处理卡片 {idx} 出错: {e}")
                 send_telegram(f"🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: {str(e)}")
