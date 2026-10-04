@@ -12,14 +12,16 @@ from selenium.webdriver.common.by import By
 from zoneinfo import ZoneInfo
 
 # ----- 配置（从环境变量读取或在双引号内填写） -----
-EMAIL = os.getenv('EMAIL') or ""
-PASSWORD = os.getenv('PASSWORD') or ""
-TG_CHAT_ID = os.getenv('TG_CHAT_ID') or ""
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN') or ""
+EMAIL = os.getenv('EMAIL') or ""         # 邮箱必填
+PASSWORD = os.getenv('PASSWORD') or ""   # 密码必填
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""  # CHAT_ID 可选
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or "" # BOT_TOKEN 可选，需同时填写CHAT_ID生效
 
 LOGIN_PATH = '/auth/login'
-BASE_URL = 'https://dash.aclclouds.com'
+LOGIN_URL = f'https://aclclouds.com{LOGIN_PATH}'
+BASE_URL = 'https://aclclouds.com'
 PROJECTS_URL = f'{BASE_URL}/dashboard/projects'
+DASHBOARD_URL = f'{BASE_URL}/dashboard'
 
 def beijing_time_str():
     try:
@@ -444,236 +446,299 @@ def has_renew_antibot_modal(sb):
             continue
     return False
 
+def get_cap_widget_state(sb):
+    """读取 Cap 验证组件当前状态：initial / verifying / done / error / missing。
+
+    Cap 组件渲染在 <cap-widget> 的 shadow DOM 里，成功（绿色对勾）时
+    .captcha 元素的 data-state 属性为 done。
+    """
+    return sb.driver.execute_script(
+        '''
+        const hosts = document.querySelectorAll('cap-widget');
+        for (const host of hosts) {
+          if (!host.shadowRoot) continue;
+          const box = host.shadowRoot.querySelector('.captcha');
+          if (box) return box.getAttribute('data-state') || 'initial';
+        }
+        return 'missing';
+        '''
+    )
+
+def find_cap_trigger(sb):
+    """定位 Cap 组件里 "Verify you're human" 前面的复选框（shadow DOM 内）。"""
+    return sb.driver.execute_script(
+        '''
+        const hosts = document.querySelectorAll('cap-widget');
+        for (const host of hosts) {
+          if (!host.shadowRoot) continue;
+          const trigger = host.shadowRoot.querySelector('.captcha-trigger');
+          if (trigger) return trigger;
+        }
+        return null;
+        '''
+    )
+
 def click_captcha_checkbox(sb, label='验证码', timeout=10):
-    """点击 ACLClouds 页面上的人机验证复选框，并处理图形验证码挑战。"""
-    selectors = [
-        'div.auth-captcha-inner[role="checkbox"]',
-        '//div[contains(., "Anti-bot confirmation")]//*[@role="checkbox"]',
-        '//div[contains(., "I am not a robot")]//*[@role="checkbox"]',
-        '//div[contains(@class, "modal") and contains(., "Secured by ACLClouds")]//*[@role="checkbox"]',
-    ]
-
-    last_error = None
-    clicked = False
-    selector = None
-    for candidate in selectors:
+    """新版 Cap 人机验证：点击 "Verify you're human" 前面的复选框，
+    等待 5 秒后检查是否出现绿色对勾（data-state=done），出现即代表验证通过。"""
+    max_attempts = 3
+    state = ''
+    for attempt in range(1, max_attempts + 1):
         try:
-            sb.wait_for_element_visible(candidate, timeout=timeout)
-            scroll_to_selector(sb, candidate)
-            sb.uc_click(candidate)
-            sb.sleep(1)
-            selector = candidate
-            clicked = True
-            break
+            sb.wait_for_element_visible('cap-widget', timeout=timeout)
         except Exception as e:
-            last_error = e
-            continue
-
-    if not clicked:
-        print(f"{label} 点击复选框失败: {last_error}")
-        return False
-
-    # 这里给 5 秒的加载缓冲，避免图形验证码尚未渲染完成时就开始点击
-    sb.sleep(5)
-    captcha_ok = handle_captcha_challenge(sb, label, timeout=20)
-    if not captcha_ok:
-        print(f"{label} 验证流程未完成，等待状态仍未确认。")
-        return False
-
-    # 验证复选框是否已勾选
-    try:
-        checked = sb.get_attribute(selector, 'aria-checked')
-        if checked == 'true':
-            print(f"{label} 验证通过")
-            return True
-        else:
-            print(f"{label} 验证未完成，当前状态: {checked}")
+            print(f"{label} 未找到 Cap 验证组件: {e}")
             return False
-    except Exception:
-        return False
 
-def handle_captcha_challenge(sb, label='验证码', timeout=20):
-    """处理图形验证码挑战：先等待挑战加载，再尝试点击对应图像。"""
-    start_time = time.time()
-    challenge = None
-    last_error = None
-    challenge_selectors = [
-        '.auth-captcha-challenge',
-        '.auth-capcha-challenge',
-        '//*[contains(@class, "captcha") and contains(@class, "challenge")]',
-        '//*[contains(@aria-label, "Click on ") or contains(@aria-label, "Select ") or contains(@class, "challenge")]',
-    ]
+        if attempt > 1:
+            print(f"{label} 第 {attempt} 次尝试...")
 
-    def get_challenge():
-        for selector in challenge_selectors:
-            try:
-                if selector.startswith('/'):
-                    elems = sb.driver.find_elements(By.XPATH, selector)
-                    for elem in elems:
-                        if elem.is_displayed():
-                            return elem
-                else:
-                    elem = sb.wait_for_element_visible(selector, timeout=1)
-                    if elem and elem.is_displayed():
-                        return elem
-            except Exception:
-                continue
-        return None
+        trigger = find_cap_trigger(sb)
+        if trigger is None:
+            print(f"{label} 未找到验证复选框")
+            return False
 
-    while time.time() - start_time < timeout:
-        challenge = get_challenge()
-        if challenge:
-            print(f"{label} 检测到图形验证码挑战")
-            break
         try:
-            checkbox = sb.driver.find_element(By.CSS_SELECTOR, 'div.auth-captcha-inner[role="checkbox"]')
-            if checkbox.get_attribute('aria-checked') == 'true':
-                print(f"{label} 验证复选框已勾选，验证码流程已完成")
+            sb.driver.execute_script(
+                'arguments[0].scrollIntoView({block: "center", inline: "center"});',
+                trigger,
+            )
+        except Exception:
+            pass
+
+        # verifying 状态下说明上一次点击仍在校验中，不要重复点击
+        state = get_cap_widget_state(sb)
+        if state != 'verifying':
+            try:
+                trigger.click()
+                print(f"{label} 已点击 Verify you're human 复选框")
+            except (ElementClickInterceptedException, WebDriverException, StaleElementReferenceException) as e:
+                print(f"{label} 普通点击失败，改用 JavaScript 点击: {e}")
+                try:
+                    sb.driver.execute_script('arguments[0].click();', trigger)
+                except Exception as e2:
+                    print(f"{label} JavaScript 点击也失败: {e2}")
+                    return False
+
+        # 等待 5 秒，让 Cap 开始校验
+        sb.sleep(5)
+
+        # 轮询等待绿色对勾（成功状态 data-state=done）
+        start_time = time.time()
+        while time.time() - start_time < 30:
+            state = get_cap_widget_state(sb)
+            if state == 'done':
+                print(f"{label} 验证通过（绿色对勾已出现）")
                 return True
-        except Exception:
-            pass
-        sb.sleep(0.3)
-
-    if not challenge:
-        print(f"{label} 等待验证码挑战加载超时: {last_error}")
-        return False
-
-    target = ''
-    try:
-        prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-captcha-prompt strong')
-        target = prompt.text.strip()
-    except Exception:
-        pass
-    if not target:
-        try:
-            prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-capcha-prompt strong')
-            target = prompt.text.strip()
-        except Exception:
-            pass
-    if not target:
-        aria_label = challenge.get_attribute('aria-label') or ''
-        if 'Click on ' in aria_label:
-            target = aria_label.split('Click on ')[-1].strip()
-
-    print(f"{label} 目标文本: {target or '未识别'}")
-
-    option_selectors = [
-        '.auth-captcha-option',
-        '.auth-capcha-option',
-        './/button',
-        './/a',
-        './/div[@role="button"]',
-    ]
-
-    def get_options(challenge_elem):
-        for sel in option_selectors:
-            try:
-                if sel.startswith('.') or sel.startswith('['):
-                    elems = challenge_elem.find_elements(By.CSS_SELECTOR, sel)
-                else:
-                    elems = challenge_elem.find_elements(By.XPATH, sel)
-                if elems:
-                    return [elem for elem in elems if elem.is_displayed() and elem.is_enabled()]
-            except Exception:
-                continue
-        return []
-
-    options = get_options(challenge)
-    if not options:
-        print(f"{label} 未找到可点击的选项")
-        return False
-
-    matched = None
-    if target:
-        for opt in options:
-            opt_text = (opt.text or '').strip()
-            if not opt_text:
-                try:
-                    img = opt.find_element(By.TAG_NAME, 'img')
-                    opt_text = (img.get_attribute('alt') or '').strip()
-                except Exception:
-                    pass
-            if not opt_text:
-                try:
-                    opt_text = (opt.get_attribute('aria-label') or '').strip()
-                except Exception:
-                    pass
-            if target.lower() in opt_text.lower():
-                matched = opt
+            if state == 'error':
+                print(f"{label} 本次校验未通过（error 状态），准备重试")
                 break
+            sb.sleep(1)
 
-    attempts = 0
-    max_attempts = 8
-    while attempts < max_attempts:
-        challenge = get_challenge()
-        if not challenge:
-            return False
-
-        options = get_options(challenge)
-        if not options:
-            print(f"{label} 当前挑战没有可点击选项，重试中...")
-            attempts += 1
-            sb.sleep(0.8)
-            continue
-
-        current_target = ''
-        try:
-            prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-captcha-prompt strong')
-            current_target = prompt.text.strip()
-        except Exception:
-            pass
-        if not current_target:
-            aria_label = challenge.get_attribute('aria-label') or ''
-            if 'Click on ' in aria_label:
-                current_target = aria_label.split('Click on ')[-1].strip()
-
-        candidate = None
-        if target and current_target and current_target.lower() == target.lower():
-            for opt in options:
-                opt_text = (opt.text or '').strip()
-                if not opt_text:
-                    try:
-                        img = opt.find_element(By.TAG_NAME, 'img')
-                        opt_text = (img.get_attribute('alt') or '').strip()
-                    except Exception:
-                        pass
-                if not opt_text:
-                    try:
-                        opt_text = (opt.get_attribute('aria-label') or '').strip()
-                    except Exception:
-                        pass
-                if target.lower() in opt_text.lower():
-                    candidate = opt
-                    break
-
-        if candidate is None:
-            candidate = options[0]
-
-        print(f"{label} 点击候选选项 #{attempts + 1} ...")
-        clicked = safe_click_element(sb, candidate, f"{label} 选项候选")
-        if not clicked:
-            attempts += 1
-            sb.sleep(0.8)
-            continue
-
-        sb.sleep(4.5)
-
-        try:
-            checkbox = sb.driver.find_element(By.CSS_SELECTOR, 'div.auth-captcha-inner[role="checkbox"]')
-            if checkbox.get_attribute('aria-checked') == 'true':
-                print(f"{label} 验证复选框已勾选，验证码流程已完成")
-                return True
-        except Exception:
-            pass
-
-        if not get_challenge():
-            print(f"{label} 挑战已消失，验证完成")
-            return True
-
-        attempts += 1
-
-    print(f"{label} 多次尝试后仍未完成验证码")
+    print(f"{label} 验证未通过，最后状态: {state}")
     return False
+
+# ==========================================================================
+# 【已停用】2026-10 登录页验证码改版为 Cap 人机验证组件（shadow DOM），
+# 不再出现“点击候选词”的图形验证码挑战，以下旧逻辑整体注释保留备查。
+# ==========================================================================
+# def handle_captcha_challenge(sb, label='验证码', timeout=20):
+#     """处理图形验证码挑战：先等待挑战加载，再尝试点击对应图像。"""
+#     start_time = time.time()
+#     challenge = None
+#     last_error = None
+#     challenge_selectors = [
+#         '.auth-captcha-challenge',
+#         '.auth-capcha-challenge',
+#         '//*[contains(@class, "captcha") and contains(@class, "challenge")]',
+#         '//*[contains(@aria-label, "Click on ") or contains(@aria-label, "Select ") or contains(@class, "challenge")]',
+#     ]
+
+#     def get_challenge():
+#         for selector in challenge_selectors:
+#             try:
+#                 if selector.startswith('/'):
+#                     elems = sb.driver.find_elements(By.XPATH, selector)
+#                     for elem in elems:
+#                         if elem.is_displayed():
+#                             return elem
+#                 else:
+#                     elem = sb.wait_for_element_visible(selector, timeout=1)
+#                     if elem and elem.is_displayed():
+#                         return elem
+#             except Exception:
+#                 continue
+#         return None
+
+#     while time.time() - start_time < timeout:
+#         challenge = get_challenge()
+#         if challenge:
+#             print(f"{label} 检测到图形验证码挑战")
+#             break
+#         try:
+#             checkbox = sb.driver.find_element(By.CSS_SELECTOR, 'div.auth-captcha-inner[role="checkbox"]')
+#             if checkbox.get_attribute('aria-checked') == 'true':
+#                 print(f"{label} 验证复选框已勾选，验证码流程已完成")
+#                 return True
+#         except Exception:
+#             pass
+#         sb.sleep(0.3)
+
+#     if not challenge:
+#         print(f"{label} 等待验证码挑战加载超时: {last_error}")
+#         return False
+
+#     target = ''
+#     try:
+#         prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-captcha-prompt strong')
+#         target = prompt.text.strip()
+#     except Exception:
+#         pass
+#     if not target:
+#         try:
+#             prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-capcha-prompt strong')
+#             target = prompt.text.strip()
+#         except Exception:
+#             pass
+#     if not target:
+#         aria_label = challenge.get_attribute('aria-label') or ''
+#         if 'Click on ' in aria_label:
+#             target = aria_label.split('Click on ')[-1].strip()
+
+#     print(f"{label} 目标文本: {target or '未识别'}")
+
+#     option_selectors = [
+#         '.auth-captcha-option',
+#         '.auth-capcha-option',
+#         '[class*="captcha-option"]',
+#         '[class*="capcha-option"]',
+#         'button',
+#         'a',
+#         '[role="button"]',
+#         'img',
+#     ]
+
+#     def get_options(challenge_elem):
+#         options = []
+#         for sel in option_selectors:
+#             try:
+#                 elems = challenge_elem.find_elements(By.CSS_SELECTOR, sel)
+#                 options.extend(elems)
+#             except Exception:
+#                 continue
+
+#         unique = []
+#         seen = set()
+#         for elem in options:
+#             try:
+#                 if not elem.is_displayed() or not elem.is_enabled():
+#                     continue
+#                 elem_id = getattr(elem, 'id', None)
+#                 if elem_id and elem_id in seen:
+#                     continue
+#                 if elem_id:
+#                     seen.add(elem_id)
+#                 unique.append(elem)
+#             except Exception:
+#                 continue
+#         return unique
+
+#     options = get_options(challenge)
+#     if not options:
+#         print(f"{label} 未找到可点击的选项")
+#         return False
+
+#     matched = None
+#     if target:
+#         for opt in options:
+#             opt_text = (opt.text or '').strip()
+#             if not opt_text:
+#                 try:
+#                     img = opt.find_element(By.TAG_NAME, 'img')
+#                     opt_text = (img.get_attribute('alt') or '').strip()
+#                 except Exception:
+#                     pass
+#             if not opt_text:
+#                 try:
+#                     opt_text = (opt.get_attribute('aria-label') or '').strip()
+#                 except Exception:
+#                     pass
+#             if target.lower() in opt_text.lower():
+#                 matched = opt
+#                 break
+
+#     attempts = 0
+#     max_attempts = 8
+#     while attempts < max_attempts:
+#         challenge = get_challenge()
+#         if not challenge:
+#             return False
+
+#         options = get_options(challenge)
+#         if not options:
+#             print(f"{label} 当前挑战没有可点击选项，重试中...")
+#             attempts += 1
+#             sb.sleep(0.8)
+#             continue
+
+#         current_target = ''
+#         try:
+#             prompt = challenge.find_element(By.CSS_SELECTOR, '.auth-captcha-prompt strong')
+#             current_target = prompt.text.strip()
+#         except Exception:
+#             pass
+#         if not current_target:
+#             aria_label = challenge.get_attribute('aria-label') or ''
+#             if 'Click on ' in aria_label:
+#                 current_target = aria_label.split('Click on ')[-1].strip()
+
+#         candidate = None
+#         if target and current_target and current_target.lower() == target.lower():
+#             for opt in options:
+#                 opt_text = (opt.text or '').strip()
+#                 if not opt_text:
+#                     try:
+#                         img = opt.find_element(By.TAG_NAME, 'img')
+#                         opt_text = (img.get_attribute('alt') or '').strip()
+#                     except Exception:
+#                         pass
+#                 if not opt_text:
+#                     try:
+#                         opt_text = (opt.get_attribute('aria-label') or '').strip()
+#                     except Exception:
+#                         pass
+#                 if target.lower() in opt_text.lower():
+#                     candidate = opt
+#                     break
+
+#         if candidate is None:
+#             candidate = options[0]
+
+#         print(f"{label} 点击候选选项 #{attempts + 1} ...")
+#         clicked = safe_click_element(sb, candidate, f"{label} 选项候选")
+#         if not clicked:
+#             attempts += 1
+#             sb.sleep(0.8)
+#             continue
+
+#         sb.sleep(4.5)
+
+#         try:
+#             checkbox = sb.driver.find_element(By.CSS_SELECTOR, 'div.auth-captcha-inner[role="checkbox"]')
+#             if checkbox.get_attribute('aria-checked') == 'true':
+#                 print(f"{label} 验证复选框已勾选，验证码流程已完成")
+#                 return True
+#         except Exception:
+#             pass
+
+#         if not get_challenge():
+#             print(f"{label} 挑战已消失，验证完成")
+#             return True
+
+#         attempts += 1
+
+#     print(f"{label} 多次尝试后仍未完成验证码")
+#     return False
 
 def mask_email(email):
     if not email or '@' not in email:
@@ -747,6 +812,151 @@ def handle_renew_antibot(sb, project_name):
     print(f"[{project_name}] 未检测到续期人机验证窗口，继续等待续期结果")
     return False
 
+def cancel_renew_antibot_dialog(sb):
+    """Cap 验证失败时点击续期弹窗里的 Cancel 关闭弹窗。"""
+    for selector in ['//div[@role="dialog"]//button[normalize-space(.)="Cancel"]',
+                     '//button[normalize-space(.)="Cancel"]']:
+        try:
+            buttons = [b for b in sb.driver.find_elements(By.XPATH, selector) if b.is_displayed()]
+            if buttons:
+                safe_click_element(sb, buttons[0], '续期弹窗 Cancel')
+                sb.sleep(1)
+                return True
+        except Exception:
+            continue
+    return False
+
+def close_notifications_popup(sb, label='通知弹窗', timeout=8):
+    """登录后若弹出 Notifications 通知弹窗，点击 Dismiss（或右上角关闭按钮）关掉。
+
+    弹窗结构：div[role="dialog"]（class 含 NotificationModal），内含
+    Dismiss 按钮和 aria-label="Fermer" 的关闭按钮。没有弹窗时直接跳过。
+    """
+    dialog_selectors = [
+        '//div[@role="dialog"][contains(@class, "NotificationModal")]',
+        '//div[@role="dialog"][@aria-label="Notifications"]',
+    ]
+    dialog = None
+    for selector in dialog_selectors:
+        try:
+            elems = [el for el in sb.driver.find_elements(By.XPATH, selector) if el.is_displayed()]
+            if elems:
+                dialog = elems[0]
+                break
+        except Exception:
+            continue
+
+    if dialog is None:
+        print(f"未检测到{label}，跳过关闭。")
+        return False
+
+    button_xpaths = [
+        './/button[contains(normalize-space(.), "Dismiss")]',
+        './/button[contains(@class, "NotificationModalSecondaryAction")]',
+        './/button[@aria-label="Fermer" or @aria-label="Close"]',
+        './/button[contains(@class, "NotificationModalClose")]',
+    ]
+    for selector in button_xpaths:
+        try:
+            buttons = [b for b in dialog.find_elements(By.XPATH, selector) if b.is_displayed()]
+        except Exception:
+            continue
+        if buttons:
+            safe_click_element(sb, buttons[0], f'{label} 关闭按钮')
+            sb.sleep(1)
+            print(f"{label} 已关闭。")
+            return True
+
+    print(f"{label} 未找到可点击的关闭按钮。")
+    return False
+
+def find_dashboard_renew_buttons(sb):
+    """找 dashboard 首页 Upcoming renewals 表格里可点击的 Renew 按钮。"""
+    buttons = []
+    for btn in sb.driver.find_elements(By.XPATH, '//button[normalize-space(.)="Renew"]'):
+        try:
+            if btn.is_displayed() and btn.is_enabled():
+                buttons.append(btn)
+        except Exception:
+            continue
+    return buttons
+
+def get_dashboard_row_info(sb, renew_button):
+    """向上定位包含该 Renew 按钮的续期行（含 data-label 单元格），返回整行文本。"""
+    return sb.driver.execute_script(
+        '''
+        let node = arguments[0];
+        for (let i = 0; i < 10 && node; i += 1, node = node.parentElement) {
+          if (node.querySelector && node.querySelector('[data-label="ID"]') && node.querySelector('[data-label="Renewal"]')) {
+            return node.innerText || '';
+          }
+        }
+        return '';
+        ''',
+        renew_button,
+    )
+
+def parse_dashboard_row(row_text):
+    """从 Upcoming renewals 行文本解析服务名、服务ID和当前过期时间。"""
+    lines = [line.strip() for line in (row_text or '').splitlines() if line.strip()]
+    service_id = lines[0] if lines else ''
+    project_name = lines[1] if len(lines) > 1 else (service_id or '未知服务')
+    old_expiry = extract_date_like(row_text) or '未知'
+    return project_name, service_id, old_expiry
+
+def wait_for_dashboard_renew_result(sb, service_id, old_expiry, timeout=40):
+    """等待 dashboard 续期结果：Cap 弹窗关闭且服务离开续期列表即视为成功。"""
+    start_time = time.time()
+    note = ''
+    while time.time() - start_time < timeout:
+        try:
+            body_text = sb.driver.find_element(By.TAG_NAME, 'body').text or ''
+
+            if has_renew_antibot_modal(sb):
+                note = 'Cap 验证弹窗尚未关闭'
+            elif 'No renewal is currently available' in body_text:
+                return True, '续期列表已清空'
+            elif service_id and service_id not in body_text:
+                return True, '服务已从续期列表移除'
+            else:
+                renewing = [b for b in sb.driver.find_elements(
+                    By.XPATH, '//button[contains(normalize-space(.), "Renewing")]') if b.is_displayed()]
+                if renewing:
+                    note = 'Renew 处理中...'
+                elif find_dashboard_renew_buttons(sb):
+                    new_date = extract_date_like(body_text)
+                    if new_date and old_expiry != '未知' and new_date != old_expiry:
+                        return True, f'续期日期已更新: {new_date}'
+                    note = 'Renew 按钮仍在，等待结果...'
+                else:
+                    return True, 'Renew 按钮已消失'
+        except Exception as e:
+            note = f'检查续期结果时暂时失败: {e}'
+        sb.sleep(1)
+    return False, note or '等待续期结果超时'
+
+def fetch_new_expiry_from_projects(sb, service_id, timeout=30):
+    """续期成功后到 My services 页面读取该服务最新的过期时间。"""
+    if not service_id:
+        return '未知'
+    try:
+        sb.open(PROJECTS_URL)
+        sb.wait_for_ready_state_complete()
+        sb.sleep(3)
+        xpath = f'//article[contains(normalize-space(.), "{service_id}")]'
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            rows = [r for r in sb.driver.find_elements(By.XPATH, xpath) if r.is_displayed()]
+            if rows:
+                date_text = extract_date_like(element_text(rows[0]))
+                if date_text:
+                    return date_text
+            sb.sleep(1)
+        print(f"未在 My services 页面找到服务 {service_id} 的过期时间。")
+    except Exception as e:
+        print(f"读取新过期时间失败: {e}")
+    return '未知'
+
 def js_set_input_value(sb, selector, value):
     sb.execute_script(
         '''
@@ -799,13 +1009,13 @@ def login(sb, email, password):
     if not fill_input(sb, '#password', password, '密码'):
         print("⚠️ 密码仍未能正确填入。")
 
-    # ---- 验证码 ----
-    captcha_ok = click_captcha_checkbox(sb, '登录验证码')
+    # ---- 验证码（2026-10 改版：Cap 组件，点击复选框后等 5 秒检查绿色对勾）----
+    captcha_ok = click_captcha_checkbox(sb, '登录验证码', timeout=15)
     if not captcha_ok:
         print("⚠️ 登录验证码未完成，暂不点击登录按钮，避免直接提交。")
         return False
 
-    sb.sleep(1)
+    sb.sleep(2)
 
     # ---- 点击登录按钮 ----
     login_page_url = sb.get_current_url()
@@ -888,10 +1098,9 @@ def main():
 
         sb.set_window_size(1366, 768)
 
-        if not is_login_page(sb):
-            sb.open(BASE_URL)
-            sb.wait_for_ready_state_complete()
-            time.sleep(2)
+        sb.open(LOGIN_URL)
+        sb.wait_for_ready_state_complete()
+        time.sleep(2)
 
         if is_login_page(sb):
             print("执行正常登录...")
@@ -908,47 +1117,65 @@ def main():
             send_telegram("⚠️ 未能确认登录状态，请检查账号密码配置。")
             return
 
-        # 2. 进入项目页
-        sb.open(PROJECTS_URL)
+        # 2. 进入 dashboard 首页
+        sb.open(DASHBOARD_URL)
         sb.wait_for_ready_state_complete()
         time.sleep(3)
 
-        # 3. 定位卡片
-        cards = find_project_cards(sb)
+        # 3. 关闭登录后的 Notifications 通知弹窗（如有，点 Dismiss 即可）
+        close_notifications_popup(sb)
 
-        if not cards:
-            print("❌ 未找到项目卡片。")
-            log_projects_page_diagnostics(sb)
-            send_telegram("⚠️ 未找到项目卡片，请检查页面结构。")
-            return
+        # 4. 逐个点击 Upcoming renewals 里的 Renew 按钮并完成 Cap 人机验证
+        processed = 0
+        max_services = 10  # 防止异常页面导致死循环
+        while processed < max_services:
+            renew_buttons = find_dashboard_renew_buttons(sb)
+            if not renew_buttons:
+                break
 
-        print(f"找到 {len(cards)} 个项目卡片。")
-        for idx, card in enumerate(cards, 1):
+            row_text = get_dashboard_row_info(sb, renew_buttons[0])
+            project_name, service_id, old_expiry = parse_dashboard_row(row_text)
+            print(f"[{project_name}] 当前过期: {old_expiry}（服务ID: {service_id or '未知'}）")
+
             try:
-                project_name = get_project_name(card, idx)
-                old_expiry = get_project_expiry(card)
-                print(f"[{project_name}] 当前过期: {old_expiry}")
+                safe_click_element(sb, renew_buttons[0], f"[{project_name}] Renew按钮")
+                print(f"[{project_name}] 点击 Renew...")
+                captcha_ok = handle_renew_antibot(sb, project_name)
+                if not captcha_ok:
+                    print(f"[{project_name}] Cap 验证未完成，尝试点击 Cancel 关闭弹窗。")
+                    cancel_renew_antibot_dialog(sb)
 
-                renew_btn = find_renew_buttons(card)
-
-                if renew_btn:
-                    action_label = get_action_button_label(renew_btn[0])
-                    safe_click_element(sb, renew_btn[0], f"[{project_name}] {action_label}按钮")
-                    print(f"[{project_name}] 点击 {action_label}...")
-                    handle_renew_antibot(sb, project_name)
-                    success, new_expiry, result_note = wait_for_renew_result(sb, idx, timeout=30)
-                    if success:
-                        print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
-                        send_telegram(build_success_message(project_name, old_expiry, new_expiry))
-                    else:
-                        send_telegram(build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note))
+                success, result_note = wait_for_dashboard_renew_result(sb, service_id, old_expiry, timeout=40)
+                if success:
+                    new_expiry = fetch_new_expiry_from_projects(sb, service_id)
+                    print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
+                    send_telegram(build_success_message(project_name, old_expiry, new_expiry))
+                    # 回到 dashboard 继续处理剩余服务
+                    sb.open(DASHBOARD_URL)
+                    sb.wait_for_ready_state_complete()
+                    time.sleep(2)
                 else:
-                    note = get_renew_note(card)
-                    print(f"无 Renew 按钮，提示: {note}")
-                    send_telegram(build_not_yet_due_message(project_name, old_expiry))
+                    print(f"续期状态未确认: {result_note}")
+                    send_telegram(build_unconfirmed_message(project_name, old_expiry, old_expiry, result_note))
             except Exception as e:
-                print(f"处理卡片 {idx} 出错: {e}")
+                print(f"处理 [{project_name}] 出错: {e}")
                 send_telegram(f"🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: {str(e)}")
+
+            processed += 1
+
+        if processed == 0:
+            body_text = ''
+            try:
+                body_text = sb.driver.find_element(By.TAG_NAME, 'body').text
+            except Exception:
+                pass
+            if 'No renewal is currently available' in body_text:
+                print("当前没有可续期的服务。")
+                send_telegram(build_not_yet_due_message('（无待续期服务）', 'No renewal is currently available'))
+            else:
+                print("❌ 未在 dashboard 找到 Renew 按钮。")
+                log_projects_page_diagnostics(sb)
+                send_telegram("⚠️ 未在 dashboard 找到 Renew 按钮，请检查页面结构。")
 
         print("所有项目处理完成。")
 
